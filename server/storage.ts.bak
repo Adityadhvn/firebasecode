@@ -1,0 +1,775 @@
+import {
+  users,
+  events,
+  ticketTypes,
+  performers,
+  tickets,
+  User,
+  Event,
+  TicketType,
+  Performer,
+  Ticket,
+  InsertUser,
+  InsertEvent,
+  InsertTicketType,
+  InsertPerformer,
+  InsertTicket,
+} from "@shared/schema";
+import { nanoid } from "nanoid";
+import { db, pool } from "./db";
+import { eq, and, desc, sql } from "drizzle-orm";
+import session from "express-session";
+import connectPg from "connect-pg-simple";
+
+const PostgresSessionStore = connectPg(session);
+
+export interface IStorage {
+  // User operations
+  getUser(id: number): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  getUserByEmail(email: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+  updateUser(id: number, user: Partial<InsertUser>): Promise<User | undefined>;
+  getUsers(): Promise<User[]>;
+
+  // Event operations
+  getEvents(): Promise<Event[]>;
+  getEvent(id: number): Promise<Event | undefined>;
+  getFeaturedEvents(): Promise<Event[]>;
+  createEvent(event: InsertEvent): Promise<Event>;
+  updateEvent(
+    id: number,
+    event: Partial<InsertEvent>,
+  ): Promise<Event | undefined>;
+  deleteEvent(id: number): Promise<boolean>;
+
+  // Ticket type operations
+  getTicketTypesByEvent(eventId: number): Promise<TicketType[]>;
+  getTicketType(id: number): Promise<TicketType | undefined>;
+  createTicketType(ticketType: InsertTicketType): Promise<TicketType>;
+  updateTicketType(
+    id: number,
+    ticketType: Partial<InsertTicketType>,
+  ): Promise<TicketType | undefined>;
+
+  // Performer operations
+  getPerformersByEvent(eventId: number): Promise<Performer[]>;
+  createPerformer(performer: InsertPerformer): Promise<Performer>;
+
+  // Ticket operations
+  getTicketsByUser(userId: number): Promise<Ticket[]>;
+  getTicketsByEvent(eventId: number): Promise<Ticket[]>;
+  getTicket(id: number): Promise<Ticket | undefined>;
+  getTicketByReference(referenceNumber: string): Promise<Ticket | undefined>;
+  createTicket(ticket: InsertTicket): Promise<Ticket>;
+  getAllTickets(): Promise<Ticket[]>;
+
+  // Organizer operations
+  getEventsByOrganizer(organizerId: number): Promise<Event[]>;
+
+  // Session store for authentication
+  sessionStore: session.Store;
+}
+
+import createMemoryStore from "memorystore";
+
+const MemoryStore = createMemoryStore(session);
+
+export class MemStorage implements IStorage {
+  private users: Map<number, User>;
+  private events: Map<number, Event>;
+  private ticketTypes: Map<number, TicketType>;
+  private performers: Map<number, Performer>;
+  private tickets: Map<number, Ticket>;
+
+  private userIdCounter: number;
+  private eventIdCounter: number;
+  private ticketTypeIdCounter: number;
+  private performerIdCounter: number;
+  private ticketIdCounter: number;
+
+  public sessionStore: session.Store;
+
+  constructor() {
+    this.users = new Map();
+    this.events = new Map();
+    this.ticketTypes = new Map();
+    this.performers = new Map();
+    this.tickets = new Map();
+
+    this.userIdCounter = 1;
+    this.eventIdCounter = 1;
+    this.ticketTypeIdCounter = 1;
+    this.performerIdCounter = 1;
+    this.ticketIdCounter = 1;
+
+    // Create session store
+    this.sessionStore = new MemoryStore({
+      checkPeriod: 86400000, // prune expired entries every 24h
+    });
+
+    this.seedData();
+  }
+
+  // User operations
+  async getUser(id: number): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    return Array.from(this.users.values()).find(
+      (user) => user.username === username,
+    );
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    return Array.from(this.users.values()).find((user) => user.email === email);
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const id = this.userIdCounter++;
+    // Ensure isOrganizer and isSuperAdmin are boolean (default to false if undefined)
+    const user: User = {
+      ...insertUser,
+      id,
+      isOrganizer: insertUser.isOrganizer === true,
+      isSuperAdmin: insertUser.isSuperAdmin === true,
+    };
+    this.users.set(id, user);
+    return user;
+  }
+
+  async getUsers(): Promise<User[]> {
+    return Array.from(this.users.values());
+  }
+  
+  async updateUser(id: number, userUpdate: Partial<InsertUser>): Promise<User | undefined> {
+    const user = this.users.get(id);
+    if (!user) return undefined;
+
+    const updatedUser = { ...user, ...userUpdate };
+    this.users.set(id, updatedUser);
+    return updatedUser;
+  }
+
+  // Event operations
+  async getEvents(): Promise<Event[]> {
+    return Array.from(this.events.values());
+  }
+
+  async getEvent(id: number): Promise<Event | undefined> {
+    return this.events.get(id);
+  }
+
+  async getFeaturedEvents(): Promise<Event[]> {
+    return Array.from(this.events.values()).filter((event) => event.featured);
+  }
+
+  async createEvent(insertEvent: InsertEvent): Promise<Event> {
+    const id = this.eventIdCounter++;
+    // Ensure featured is a boolean (default to false if undefined)
+    const event: Event = {
+      ...insertEvent,
+      id,
+      featured: insertEvent.featured === true,
+    };
+    this.events.set(id, event);
+    return event;
+  }
+
+  async updateEvent(
+    id: number,
+    eventUpdate: Partial<InsertEvent>,
+  ): Promise<Event | undefined> {
+    const event = this.events.get(id);
+    if (!event) return undefined;
+
+    const updatedEvent = { ...event, ...eventUpdate };
+    this.events.set(id, updatedEvent);
+    return updatedEvent;
+  }
+
+  async deleteEvent(id: number): Promise<boolean> {
+    return this.events.delete(id);
+  }
+
+  // Ticket type operations
+  async getTicketTypesByEvent(eventId: number): Promise<TicketType[]> {
+    return Array.from(this.ticketTypes.values()).filter(
+      (ticketType) => ticketType.eventId === eventId,
+    );
+  }
+
+  async getTicketType(id: number): Promise<TicketType | undefined> {
+    return this.ticketTypes.get(id);
+  }
+
+  async createTicketType(
+    insertTicketType: InsertTicketType,
+  ): Promise<TicketType> {
+    const id = this.ticketTypeIdCounter++;
+    // Ensure price is a string
+    const ticketType: TicketType = {
+      ...insertTicketType,
+      id,
+      price: String(insertTicketType.price),
+    };
+    this.ticketTypes.set(id, ticketType);
+    return ticketType;
+  }
+
+  async updateTicketType(
+    id: number,
+    ticketTypeUpdate: Partial<InsertTicketType>,
+  ): Promise<TicketType | undefined> {
+    const ticketType = this.ticketTypes.get(id);
+    if (!ticketType) return undefined;
+
+    // Create a new object with the updates, ensuring price is a string
+    const updatedTicketType = {
+      ...ticketType,
+    };
+
+    // Apply each property from the update individually with type handling
+    if (ticketTypeUpdate.name !== undefined)
+      updatedTicketType.name = ticketTypeUpdate.name;
+    if (ticketTypeUpdate.description !== undefined)
+      updatedTicketType.description = ticketTypeUpdate.description;
+    if (ticketTypeUpdate.eventId !== undefined)
+      updatedTicketType.eventId = ticketTypeUpdate.eventId;
+    if (ticketTypeUpdate.available !== undefined)
+      updatedTicketType.available = ticketTypeUpdate.available;
+    if (ticketTypeUpdate.price !== undefined)
+      updatedTicketType.price = String(ticketTypeUpdate.price);
+
+    this.ticketTypes.set(id, updatedTicketType);
+    return updatedTicketType;
+  }
+
+  // Performer operations
+  async getPerformersByEvent(eventId: number): Promise<Performer[]> {
+    return Array.from(this.performers.values()).filter(
+      (performer) => performer.eventId === eventId,
+    );
+  }
+
+  async createPerformer(insertPerformer: InsertPerformer): Promise<Performer> {
+    const id = this.performerIdCounter++;
+
+    // Create the performer object with required fields
+    const performer: Performer = {
+      id,
+      name: insertPerformer.name,
+      imageUrl: insertPerformer.imageUrl,
+      eventId: insertPerformer.eventId,
+      time: insertPerformer.time,
+      // Set isHeadliner explicitly based on the input value
+      isHeadliner: insertPerformer.isHeadliner === true ? true : false,
+    };
+
+    this.performers.set(id, performer);
+    return performer;
+  }
+
+  // Ticket operations
+  async getTicketsByUser(userId: number): Promise<Ticket[]> {
+    return Array.from(this.tickets.values()).filter(
+      (ticket) => ticket.userId === userId,
+    );
+  }
+
+  async getTicketsByEvent(eventId: number): Promise<Ticket[]> {
+    return Array.from(this.tickets.values()).filter(
+      (ticket) => ticket.eventId === eventId,
+    );
+  }
+
+  async getTicket(id: number): Promise<Ticket | undefined> {
+    return this.tickets.get(id);
+  }
+
+  async getTicketByReference(
+    referenceNumber: string,
+  ): Promise<Ticket | undefined> {
+    return Array.from(this.tickets.values()).find(
+      (ticket) => ticket.referenceNumber === referenceNumber,
+    );
+  }
+
+  async createTicket(insertTicket: InsertTicket): Promise<Ticket> {
+    const id = this.ticketIdCounter++;
+    const ticket: Ticket = {
+      ...insertTicket,
+      id,
+      purchaseDate: new Date(),
+    };
+    this.tickets.set(id, ticket);
+    return ticket;
+  }
+
+  async getAllTickets(): Promise<Ticket[]> {
+    return Array.from(this.tickets.values());
+  }
+
+  // Organizer operations
+  async getEventsByOrganizer(organizerId: number): Promise<Event[]> {
+    return Array.from(this.events.values()).filter(
+      (event) => event.organizedById === organizerId,
+    );
+  }
+
+  // Seed with initial demo data
+  private seedData() {
+    // Create sample users
+    const user1: User = {
+      id: this.userIdCounter++,
+      username: "adityadhawan",
+      // Plain text password for demo purposes
+      password: "Gokussj3@",
+      email: "admin@example.com",
+      fullName: "Aditya Dhawan",
+      isOrganizer: true,
+      isSuperAdmin: true, // Special role for managing organizers
+    };
+
+    const user2: User = {
+      id: this.userIdCounter++,
+      username: "eventorganizer",
+      // Plain text password for demo purposes
+      password: "password123",
+      email: "organizer@example.com",
+      fullName: "Event Organizer",
+      isOrganizer: true,
+      isSuperAdmin: false,
+    };
+
+    const adminUser: User = {
+      id: this.userIdCounter++,
+      username: "admin",
+      // Plain text password for demo purposes
+      password: "admin",
+      email: "admin2@example.com",
+      fullName: "Admin User",
+      isOrganizer: true,
+      isSuperAdmin: false,
+    };
+
+    this.users.set(user1.id, user1);
+    this.users.set(user2.id, user2);
+    this.users.set(adminUser.id, adminUser);
+
+    // Create sample events
+    const event1: Event = {
+      id: this.eventIdCounter++,
+      title: "Neon Dreams Festival",
+      description:
+        "Join us for a night of electronic music and visual spectacles at the Neon Dreams Festival. Featuring top DJs and performers from around the world, immersive light shows, and unforgettable experiences. This is the summer's most anticipated electronic music event with multiple stages and genres.",
+      imageUrl:
+        "https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=2070&q=80",
+      date: new Date("2023-06-10T20:00:00"),
+      location: "Warehouse District",
+      address: "123 Main St",
+      organizedById: user2.id,
+      featured: true,
+      tags: ["Electronic", "Festival", "DJ", "Live Music"],
+    };
+
+    const event2: Event = {
+      id: this.eventIdCounter++,
+      title: "Techno Underground",
+      description:
+        "Experience the best underground techno scene with internationally acclaimed DJs in an intimate venue.",
+      imageUrl:
+        "https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=2070&q=80",
+      date: new Date("2023-06-15T22:00:00"),
+      location: "Pulse Club",
+      address: "456 Club Ave",
+      organizedById: user2.id,
+      featured: true,
+      tags: ["Techno", "Underground", "DJ"],
+    };
+
+    const event3: Event = {
+      id: this.eventIdCounter++,
+      title: "Summer Bass Nights",
+      description:
+        "Feel the rhythm of summer with deep bass music all night long.",
+      imageUrl:
+        "https://images.unsplash.com/photo-1642207193107-490688c031f0?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=2070&q=80",
+      date: new Date("2023-06-20T21:00:00"),
+      location: "Echo Lounge",
+      address: "789 Sound Blvd",
+      organizedById: user2.id,
+      featured: false,
+      tags: ["Bass", "Electronic", "Summer"],
+    };
+
+    const event4: Event = {
+      id: this.eventIdCounter++,
+      title: "Retro Wave Party",
+      description:
+        "Celebrate the sounds of the 80s and 90s with a night of retro electronic music.",
+      imageUrl:
+        "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=2074&q=80",
+      date: new Date("2023-06-22T22:00:00"),
+      location: "Neon Club",
+      address: "101 Retro Road",
+      organizedById: user2.id,
+      featured: false,
+      tags: ["Retro", "Electronic", "Party"],
+    };
+
+    const event5: Event = {
+      id: this.eventIdCounter++,
+      title: "House Music Showcase",
+      description:
+        "Discover the latest trends in house music with talented local and international DJs.",
+      imageUrl:
+        "https://images.unsplash.com/photo-1540039155733-5bb30b53aa14?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=2074&q=80",
+      date: new Date("2023-06-25T20:00:00"),
+      location: "Rhythm Hall",
+      address: "202 Beat Street",
+      organizedById: user2.id,
+      featured: false,
+      tags: ["House", "Electronic", "DJ"],
+    };
+
+    this.events.set(event1.id, event1);
+    this.events.set(event2.id, event2);
+    this.events.set(event3.id, event3);
+    this.events.set(event4.id, event4);
+    this.events.set(event5.id, event5);
+
+    // Create sample ticket types
+    const ticketType1: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event1.id,
+      name: "General Admission",
+      description: "Access to all areas except VIP",
+      price: "45.00",
+      available: 200,
+    };
+
+    const ticketType2: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event1.id,
+      name: "VIP Access",
+      description: "Premium viewing areas & complimentary drinks",
+      price: "95.00",
+      available: 50,
+    };
+
+    const ticketType3: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event1.id,
+      name: "Early Entry",
+      description: "Enter 1 hour before general admission",
+      price: "65.00",
+      available: 100,
+    };
+
+    const ticketType4: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event2.id,
+      name: "Standard Entry",
+      description: "Regular club access",
+      price: "30.00",
+      available: 150,
+    };
+
+    const ticketType5: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event3.id,
+      name: "General Admission",
+      description: "Basic entry to the event",
+      price: "25.00",
+      available: 100,
+    };
+
+    const ticketType6: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event4.id,
+      name: "Standard Entry",
+      description: "Regular club access",
+      price: "30.00",
+      available: 120,
+    };
+
+    const ticketType7: TicketType = {
+      id: this.ticketTypeIdCounter++,
+      eventId: event5.id,
+      name: "General Admission",
+      description: "Basic entry to the event",
+      price: "35.00",
+      available: 150,
+    };
+
+    this.ticketTypes.set(ticketType1.id, ticketType1);
+    this.ticketTypes.set(ticketType2.id, ticketType2);
+    this.ticketTypes.set(ticketType3.id, ticketType3);
+    this.ticketTypes.set(ticketType4.id, ticketType4);
+    this.ticketTypes.set(ticketType5.id, ticketType5);
+    this.ticketTypes.set(ticketType6.id, ticketType6);
+    this.ticketTypes.set(ticketType7.id, ticketType7);
+
+    // Create sample performers
+    const performer1: Performer = {
+      id: this.performerIdCounter++,
+      eventId: event1.id,
+      name: "DJ Pulse",
+      imageUrl:
+        "https://images.unsplash.com/photo-1499364615650-ec38552f4f34?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1772&q=80",
+      time: "10:00 PM",
+      isHeadliner: true,
+    };
+
+    const performer2: Performer = {
+      id: this.performerIdCounter++,
+      eventId: event1.id,
+      name: "Electra",
+      imageUrl:
+        "https://images.unsplash.com/photo-1501386761578-eac5c94b800a?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1770&q=80",
+      time: "9:00 PM",
+      isHeadliner: false,
+    };
+
+    const performer3: Performer = {
+      id: this.performerIdCounter++,
+      eventId: event1.id,
+      name: "Synthesize",
+      imageUrl:
+        "https://images.unsplash.com/photo-1493676304819-0d7a8d026dcf?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1974&q=80",
+      time: "8:00 PM",
+      isHeadliner: false,
+    };
+
+    this.performers.set(performer1.id, performer1);
+    this.performers.set(performer2.id, performer2);
+    this.performers.set(performer3.id, performer3);
+
+    // Create a sample ticket
+    const ticket1: Ticket = {
+      id: this.ticketIdCounter++,
+      userId: user1.id,
+      eventId: event1.id,
+      ticketTypeId: ticketType1.id,
+      quantity: 1,
+      totalPrice: "53.50", // Price + fees
+      purchaseDate: new Date("2023-06-02T14:30:00"),
+      referenceNumber: "NEO-1234567890",
+      paymentDetails: {
+        method: "Credit Card",
+        last4: "4242",
+        subtotal: "45.00",
+        serviceFee: "5.00",
+        tax: "3.50",
+      },
+    };
+
+    this.tickets.set(ticket1.id, ticket1);
+  }
+}
+
+// Database Storage Implementation
+
+export class DatabaseStorage implements IStorage {
+  sessionStore: session.Store;
+
+  constructor() {
+    this.sessionStore = new PostgresSessionStore({ 
+      pool, 
+      createTableIfMissing: true 
+    });
+  }
+
+  // User operations
+  async getUser(id: number): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user;
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user;
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const [user] = await db
+      .insert(users)
+      .values(insertUser)
+      .returning();
+    return user;
+  }
+
+  async updateUser(id: number, userUpdate: Partial<InsertUser>): Promise<User | undefined> {
+    const [user] = await db
+      .update(users)
+      .set(userUpdate)
+      .where(eq(users.id, id))
+      .returning();
+    return user;
+  }
+
+  async getUsers(): Promise<User[]> {
+    return db.select().from(users);
+  }
+
+  // Event operations
+  async getEvents(): Promise<Event[]> {
+    return db.select().from(events).orderBy(desc(events.date));
+  }
+
+  async getEvent(id: number): Promise<Event | undefined> {
+    const [event] = await db.select().from(events).where(eq(events.id, id));
+    return event;
+  }
+
+  async getFeaturedEvents(): Promise<Event[]> {
+    return db
+      .select()
+      .from(events)
+      .where(eq(events.featured, true))
+      .orderBy(desc(events.date))
+      .limit(5);
+  }
+
+  async createEvent(insertEvent: InsertEvent): Promise<Event> {
+    const [event] = await db
+      .insert(events)
+      .values(insertEvent)
+      .returning();
+    return event;
+  }
+
+  async updateEvent(id: number, eventUpdate: Partial<InsertEvent>): Promise<Event | undefined> {
+    const [event] = await db
+      .update(events)
+      .set(eventUpdate)
+      .where(eq(events.id, id))
+      .returning();
+    return event;
+  }
+
+  async deleteEvent(id: number): Promise<boolean> {
+    const result = await db
+      .delete(events)
+      .where(eq(events.id, id));
+    return true;
+  }
+
+  // Ticket type operations
+  async getTicketTypesByEvent(eventId: number): Promise<TicketType[]> {
+    return db
+      .select()
+      .from(ticketTypes)
+      .where(eq(ticketTypes.eventId, eventId));
+  }
+
+  async getTicketType(id: number): Promise<TicketType | undefined> {
+    const [ticketType] = await db
+      .select()
+      .from(ticketTypes)
+      .where(eq(ticketTypes.id, id));
+    return ticketType;
+  }
+
+  async createTicketType(insertTicketType: InsertTicketType): Promise<TicketType> {
+    const [ticketType] = await db
+      .insert(ticketTypes)
+      .values(insertTicketType)
+      .returning();
+    return ticketType;
+  }
+
+  async updateTicketType(id: number, ticketTypeUpdate: Partial<InsertTicketType>): Promise<TicketType | undefined> {
+    const [ticketType] = await db
+      .update(ticketTypes)
+      .set(ticketTypeUpdate)
+      .where(eq(ticketTypes.id, id))
+      .returning();
+    return ticketType;
+  }
+
+  // Performer operations
+  async getPerformersByEvent(eventId: number): Promise<Performer[]> {
+    return db
+      .select()
+      .from(performers)
+      .where(eq(performers.eventId, eventId));
+  }
+
+  async createPerformer(insertPerformer: InsertPerformer): Promise<Performer> {
+    const [performer] = await db
+      .insert(performers)
+      .values(insertPerformer)
+      .returning();
+    return performer;
+  }
+
+  // Ticket operations
+  async getTicketsByUser(userId: number): Promise<Ticket[]> {
+    return db
+      .select()
+      .from(tickets)
+      .where(eq(tickets.userId, userId))
+      .orderBy(desc(tickets.purchaseDate));
+  }
+
+  async getTicketsByEvent(eventId: number): Promise<Ticket[]> {
+    return db
+      .select()
+      .from(tickets)
+      .where(eq(tickets.eventId, eventId));
+  }
+
+  async getTicket(id: number): Promise<Ticket | undefined> {
+    const [ticket] = await db
+      .select()
+      .from(tickets)
+      .where(eq(tickets.id, id));
+    return ticket;
+  }
+
+  async getTicketByReference(referenceNumber: string): Promise<Ticket | undefined> {
+    const [ticket] = await db
+      .select()
+      .from(tickets)
+      .where(eq(tickets.referenceNumber, referenceNumber));
+    return ticket;
+  }
+
+  async createTicket(insertTicket: InsertTicket): Promise<Ticket> {
+    const [ticket] = await db
+      .insert(tickets)
+      .values(insertTicket)
+      .returning();
+    return ticket;
+  }
+
+  async getAllTickets(): Promise<Ticket[]> {
+    return db.select().from(tickets);
+  }
+
+  // Organizer operations
+  async getEventsByOrganizer(organizerId: number): Promise<Event[]> {
+    return db
+      .select()
+      .from(events)
+      .where(eq(events.organizerId, organizerId))
+      .orderBy(desc(events.date));
+  }
+}
+
+// Use in-memory storage for development, database for production
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Default to database storage if DATABASE_URL is defined, otherwise use memory storage
+export const storage = process.env.DATABASE_URL
+  ? new DatabaseStorage()
+  : new MemStorage();
+
